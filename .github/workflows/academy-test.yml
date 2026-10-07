@@ -1,0 +1,87 @@
+name: Academy test agent
+
+on:
+  # Called from the Academy site's own pipeline (see docs/academy-repo-integration.md).
+  workflow_call:
+    inputs:
+      base_url: { type: string, required: true }
+      build_id: { type: string, required: false, default: '' }
+      environment: { type: string, required: false, default: 'preview' }
+      changed_paths: { type: string, required: false, default: '' }
+      fail_on: { type: string, required: false, default: 'block' }
+    secrets:
+      ANTHROPIC_API_KEY: { required: true }
+      TEST_ACCOUNT_EMAIL: { required: false }
+      TEST_ACCOUNT_PASSWORD: { required: false }
+      TEST_AGENT_REPO_TOKEN: { required: false }
+      VERCEL_AUTOMATION_BYPASS_SECRET: { required: false }
+  # Run by hand from the Actions tab.
+  workflow_dispatch:
+    inputs:
+      base_url: { description: 'Deployment URL to test', required: true, default: 'https://academy.yallo.co' }
+      environment: { description: 'preview | staging | production (production is read-only)', required: true, default: 'production' }
+      fail_on: { description: 'block | warn', required: true, default: 'block' }
+  # Nightly read-only check of production.
+  schedule:
+    - cron: '30 1 * * *'
+
+concurrency:
+  group: academy-test-${{ inputs.base_url || 'production' }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test ${{ inputs.base_url || 'https://academy.yallo.co' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    env:
+      BASE_URL: ${{ inputs.base_url || 'https://academy.yallo.co' }}
+      ENVIRONMENT: ${{ inputs.environment || 'production' }}
+      BUILD_ID: ${{ inputs.build_id || format('{0}-{1}', github.run_id, github.run_attempt) }}
+      CHANGED_PATHS: ${{ inputs.changed_paths || '' }}
+      FAIL_ON: ${{ inputs.fail_on || 'block' }}
+      MAX_PAGES: '30'
+      MODEL: sonnet
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      TEST_ACCOUNT_EMAIL: ${{ secrets.TEST_ACCOUNT_EMAIL }}
+      TEST_ACCOUNT_PASSWORD: ${{ secrets.TEST_ACCOUNT_PASSWORD }}
+      VERCEL_AUTOMATION_BYPASS_SECRET: ${{ secrets.VERCEL_AUTOMATION_BYPASS_SECRET }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Always this test-agent repo, also when called from the Academy repo.
+          # Change if the repo moves. A private cross-repo checkout needs TEST_AGENT_REPO_TOKEN.
+          repository: kolarvc29/academy-test-agent
+          token: ${{ secrets.TEST_AGENT_REPO_TOKEN || github.token }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies and browsers
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium webkit
+          npm install -g @anthropic-ai/claude-code
+
+      - name: Unit tests (gate)
+        run: npm test
+
+      - name: Run the testing agent
+        id: agent
+        run: |
+          # A test account is only used outside production; see the prompt's constraints.
+          if [ -n "${TEST_ACCOUNT_EMAIL}" ] && [ "${ENVIRONMENT}" != "production" ]; then export TEST_ACCOUNT=1; fi
+          bash scripts/run-agent.sh
+
+      - name: Upload report and screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: academy-test-${{ env.BUILD_ID }}
+          path: |
+            reports/${{ env.BUILD_ID }}/report.json
+            reports/${{ env.BUILD_ID }}/summary.md
+            reports/${{ env.BUILD_ID }}/work/screens/
+          retention-days: 30
